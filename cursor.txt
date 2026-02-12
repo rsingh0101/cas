@@ -1,0 +1,117 @@
+1. values.yaml – entity clusters (kube-prometheus-stack, remote_write + TLS)
+Example values-entity-cluster-a.yaml (adapt cluster-a and CA paths per cluster):
+# kube-prometheus-stack values for ENTITY CLUSTERSprometheus:  prometheusSpec:    externalLabels:      cluster: cluster-a      # <-- UNIQUE PER CLUSTER      environment: production    remoteWrite:      - url: https://monitoring.company.com:10901/api/v1/receive        name: central-thanos-receive        remoteTimeout: 30s        queueConfig:          capacity: 50000          maxShards: 200          maxSamplesPerSend: 10000          batchSendDeadline: 5s          minBackoff: 1s          maxBackoff: 60s        writeRelabelConfigs:          # Example: drop very high-cardinality metrics          - sourceLabels: [__name__]            regex: "go_gc.*|apiserver_request_duration_seconds_bucket"            action: drop        tlsConfig:          # Corporate root / intermediate CA bundle that signed HAProxy cert          caFile: /etc/prometheus/certs/corp-root-ca.pem          # Optional: pin hostname if different from URL host          serverName: monitoring.company.com          # Enforce certificate verification          insecureSkipVerify: false        # Optional mTLS (if you choose to use client auth on HAProxy)        # basicAuth:        #   username: prom-cluster-a        #   password: <ref to secret>    # Mount CA bundle for TLS validation    additionalScrapeConfigs: []   # unchanged    additionalVolumes:      - name: prometheus-corp-ca        secret:          secretName: prometheus-corp-ca    additionalVolumeMounts:      - name: prometheus-corp-ca        mountPath: /etc/prometheus/certs        readOnly: true# Create this secret containing corp-root-ca.pem:# kubectl -n monitoring create secret generic prometheus-corp-ca \#   --from-file=corp-root-ca.pem=/path/to/corp-root-ca.pem
+Per other clusters, copy the file and only change:
+externalLabels:  cluster: cluster-b
+2. values.yaml – central cluster Thanos (Receive HA + Query + Compactor)
+Below assumes the bitnami/thanos Helm chart (common in production). Adjust namespace as needed (e.g. monitoring), and S3 configuration to your backend (MinIO/Ceph/S3).
+2.1 Object storage secret (created once, referenced by Helm)
+# thanos-objstore.yaml (Kubernetes Secret, not Helm values)apiVersion: v1kind: Secretmetadata:  name: thanos-objstore  namespace: monitoringtype: OpaquestringData:  objstore.yml: |    type: S3    config:      bucket: "thanos-metrics"      endpoint: "minio.monitoring.svc.cluster.local:9000"      access_key: "THANOS_ACCESS_KEY"      secret_key: "THANOS_SECRET_KEY"      insecure: true          # set false if using TLS to object store      signature_version2: false      http_config:        idle_conn_timeout: 90s        response_header_timeout: 2m
+Apply:
+kubectl apply -f thanos-objstore.yaml
+2.2 Hashrings config for Thanos Receive HA
+# thanos-receive-hashrings.yaml (Kubernetes ConfigMap)apiVersion: v1kind: ConfigMapmetadata:  name: thanos-receive-hashrings  namespace: monitoringdata:  hashrings.json: |    [      {        "hashring": "default",        "endpoints": [          "thanos-receive-0.thanos-receive.monitoring.svc.cluster.local:10901",          "thanos-receive-1.thanos-receive.monitoring.svc.cluster.local:10901"        ]      }    ]
+Apply:
+kubectl apply -f thanos-receive-hashrings.yaml
+2.3 values-thanos-central.yaml (bitnami/thanos)
+# bitnami/thanos values for CENTRAL CLUSTERglobal:  imageRegistry: ""  storageClass: "fast-ssd"  # adapt to your storage classexistingObjstoreSecret: thanos-objstoreexistingObjstoreSecretKey: objstore.yml################################################################################ Thanos Receive – HA, remote_write endpoint###############################################################################receive:  enabled: true  replicaCount: 2  # StatefulSet so endpoints are stable for hashring  statefulset:    enabled: true  service:    type: ClusterIP    port: 10901    # internal-only, no NodePort    annotations:      prometheus.io/scrape: "true"      prometheus.io/port: "10901"      prometheus.io/path: "/metrics"  extraFlags:    # API for Prometheus remote_write:    - --receive    - --http-address=0.0.0.0:10901    - --grpc-address=0.0.0.0:10902    - --receive.hashrings-file=/etc/thanos/hashrings/hashrings.json    - --receive.local-endpoint=$(POD_NAME).thanos-receive.monitoring.svc.cluster.local:10901    - --tsdb.path=/var/thanos/receive    - --objstore.config-file=/etc/thanos/objstore/objstore.yml    - --receive.replication-factor=2    - --log.level=info  extraEnvVars:    - name: POD_NAME      valueFrom:        fieldRef:          fieldPath: metadata.name  extraVolumes:    - name: objstore-config      secret:        secretName: thanos-objstore        items:          - key: objstore.yml            path: objstore.yml    - name: hashrings-config      configMap:        name: thanos-receive-hashrings  extraVolumeMounts:    - name: objstore-config      mountPath: /etc/thanos/objstore      readOnly: true    - name: hashrings-config      mountPath: /etc/thanos/hashrings      readOnly: true  persistence:    enabled: true    size: 200Gi    storageClass: fast-ssd  resources:    requests:      cpu: "2"      memory: "8Gi"    limits:      cpu: "4"      memory: "16Gi"################################################################################ Thanos Query – global PromQL entrypoint###############################################################################query:  enabled: true  replicaCount: 2  service:    type: ClusterIP    port: 10903  extraFlags:    - --query.replica-label=replica    - --store=dnssrv+_grpc._tcp.thanos-receive.monitoring.svc.cluster.local    # If you add Store Gateway later:    # - --store=dnssrv+_grpc._tcp.thanos-storegateway.monitoring.svc.cluster.local    - --grpc-address=0.0.0.0:10904    - --http-address=0.0.0.0:9090    - --log.level=info  ingress:    enabled: false   # You front this with Grafana/ingress or internal LB if needed  resources:    requests:      cpu: "1"      memory: "4Gi"    limits:      cpu: "2"      memory: "8Gi"################################################################################ Thanos Compactor – compaction + downsampling###############################################################################compactor:  enabled: true  extraFlags:    - --data-dir=/var/thanos/compact    - --objstore.config-file=/etc/thanos/objstore/objstore.yml    - --retention.resolution-raw=15d    - --retention.resolution-5m=90d    - --retention.resolution-1h=365d    - --log.level=info  persistence:    enabled: true    size: 100Gi    storageClass: fast-ssd  extraVolumes:    - name: objstore-config      secret:        secretName: thanos-objstore        items:          - key: objstore.yml            path: objstore.yml  extraVolumeMounts:    - name: objstore-config      mountPath: /etc/thanos/objstore      readOnly: true  resources:    requests:      cpu: "2"      memory: "8Gi"    limits:      cpu: "4"      memory: "16Gi"
+Install:
+helm repo add bitnami https://charts.bitnami.com/bitnamihelm upgrade --install thanos bitnami/thanos \  --namespace monitoring --create-namespace \  -f values-thanos-central.yaml
+3. Kubernetes Service – Thanos Receive, internal ClusterIP only
+If your chart doesn’t already create it exactly as desired, you can override or create explicitly:
+apiVersion: v1kind: Servicemetadata:  name: thanos-receive  namespace: monitoring  labels:    app.kubernetes.io/name: thanos-receivespec:  type: ClusterIP        # INTERNAL ONLY  clusterIP: None        # <-- optional; use headless + StatefulSet for explicit endpoints  ports:    - name: http      port: 10901      targetPort: 10901      protocol: TCP  selector:    app.kubernetes.io/name: thanos-receive
+If you prefer a normal ClusterIP with kube load-balancing, set clusterIP to a regular IP (omit None). Either way, do not set type: NodePort or LoadBalancer.
+4. HAProxy configuration (TLS termination on 10901, RR to Thanos Receive, health checks)
+Assuming HAProxy runs on the central monitoring host, has access to corporate CA-signed cert for monitoring.company.com, and can reach the K8s thanos-receive ClusterIP or headless endpoints.
+# /etc/haproxy/haproxy.cfgglobal  log /dev/log local0  log /dev/log local1 notice  maxconn 50000  tune.ssl.default-dh-param 2048  ssl-default-bind-ciphers PROFILE=SYSTEM  ssl-default-bind-options no-sslv3 no-tls13-ticketsdefaults  log     global  mode    http  option  httplog  option  dontlognull  timeout connect 5s  timeout client  60s  timeout server  60s  timeout http-keep-alive 10s  timeout http-request    10s  maxconn  30000frontend fe_prometheus_remote_write  bind *:10901 ssl crt /etc/haproxy/certs/monitoring.company.com.pem alpn h2,http/1.1  mode http  # Optional: restrict to known Prometheus source IPs  # acl allowed_prom src 10.10.0.0/16 10.20.0.0/16  # http-request deny if !allowed_prom  # Optional mTLS – uncomment if you require client certificates  # ca-file /etc/haproxy/ca/clients-ca.pem  # verify required  default_backend be_thanos_receivebackend be_thanos_receive  mode http  balance roundrobin  option httpchk GET /-/healthy  http-check expect status 200  # If using headless service + StatefulSet:  server thanos-receive-0 thanos-receive-0.thanos-receive.monitoring.svc.cluster.local:10901 check  server thanos-receive-1 thanos-receive-1.thanos-receive.monitoring.svc.cluster.local:10901 check  # If you prefer to let Kubernetes handle pod LB instead, use a single ClusterIP:  # server thanos-receive-svc thanos-receive.monitoring.svc.cluster.local:10901 check  # Hardening  http-request set-header X-Forwarded-Proto https  http-request set-header X-Forwarded-For %[src]
+Cert placement:
+Place full chain + private key in /etc/haproxy/certs/monitoring.company.com.pem:
+cat monitoring.company.com.key monitoring.company.com.crt chain.pem \  > /etc/haproxy/certs/monitoring.company.com.pemchmod 600 /etc/haproxy/certs/monitoring.company.com.pemchown root:root /etc/haproxy/certs/monitoring.company.com.pem
+Corporate DNS:
+monitoring.company.com → HAProxy IP (central monitoring server).
+Port 10901 TCP open from all entity clusters to that HAProxy IP.
+Prometheus CA validation:
+Corporate root CA (that signs monitoring.company.com cert) distributed into each cluster as prometheus-corp-ca secret and used via tlsConfig.caFile (see entity values).
+5. TLS configuration recommendations
+On HAProxy
+Use strong ciphers and modern TLS versions; rely on distro PROFILE=SYSTEM or explicitly set:
+Minimum TLS v1.2, prefer TLS v1.3.
+Store cert + key only on HAProxy, not in Kubernetes.
+If you want client auth, create a dedicated client CA and configure:
+ca-file /etc/haproxy/ca/prom-clients-ca.pem
+verify required in frontend.
+Then issue client certs per cluster and configure Prometheus tls_config with cert_file and key_file.
+On Prometheus (remote_write)
+Always set tlsConfig.caFile to a CA bundle that validates monitoring.company.com.
+Optionally set serverName if DNS name differs from cert CN/SAN.
+Do not set insecureSkipVerify: true in production.
+For mTLS, set:
+certFile: /etc/prometheus/certs/cluster-a-client.crt
+keyFile: /etc/prometheus/certs/cluster-a-client.key
+Rotate certs via Kubernetes Secrets and rolling Prometheus Pods.
+6. Scaling guidance
+6.1 Thanos Receive
+Baseline sizing:
+Start with 2 replicas (replication-factor=2) each:
+2–4 vCPU
+8–16 GiB RAM
+200–500 GiB fast SSD/local PV for WAL.
+Rule of thumb:
+A single reasonably sized Thanos Receive instance can typically handle on the order of 100–200k samples/sec depending on hardware and flags.
+Calculate approximate samples/sec:
+#metrics * scrape_interval^-1 * #targets summed across clusters.
+When to scale up:
+Monitor:
+thanos_receive_forward_requests_total
+thanos_receive_request_duration_seconds_bucket
+thanos_receive_samples_pending
+If p95 of thanos_receive_request_duration_seconds > 2–3s or CPU constantly > 70%, add replicas and adjust hashrings.
+When to scale out beyond 2:
+Increase replicaCount and update hashrings.json with new stable endpoints:
+Add e.g. thanos-receive-2 and thanos-receive-3.
+Consider sharding by tenant / cluster / environment via multiple hashrings if you reach very high scale.
+6.2 Thanos Query
+Start with 2 replicas, fronted by internal LoadBalancer/Ingress/Grafana data source.
+Scale horizontally when:
+Concurrent PromQL queries increase.
+Query response times grow and CPU stays >70–80% for extended periods.
+Monitor:
+thanos_query_concurrent_gate_queries_in_flight
+thanos_query_api_instant_query_duration_seconds
+thanos_query_api_range_query_duration_seconds
+For very large deployments:
+Enable and scale a query-frontend (bitnami/thanos supports this) for caching and parallelization.
+7. Validation checklist
+7.1 Test remote_write connectivity (network + TLS)
+From an entity cluster node or a debug Pod:
+# Validate TCP connectivity and TLSopenssl s_client -connect monitoring.company.com:10901 -servername monitoring.company.com \  -CAfile /path/to/corp-root-ca.pem -showcerts </dev/null
+You should see a valid certificate chain and Verify return code: 0 (ok).
+If HAProxy exposes a health endpoint (via Thanos Receive):
+curl -v --cacert /path/to/corp-root-ca.pem \  https://monitoring.company.com:10901/-/healthy
+You should get HTTP 200.
+7.2 Verify Prometheus remote_write status
+In each entity cluster Prometheus UI:
+Check /metrics for:
+prometheus_remote_storage_succeeded_samples_total
+prometheus_remote_storage_failed_samples_total
+prometheus_remote_storage_retries_total
+prometheus_remote_storage_queue_highest_sent_timestamp_seconds
+failed_samples_total should remain near 0, queue_highest_sent_timestamp_seconds should not lag far behind current time.
+Example PromQL on the entity cluster Prometheus:
+rate(prometheus_remote_storage
+7.3 Verify ingestion into Thanos / central store
+From Thanos Query (Grafana data source pointing only to thanos-query):
+Run:
+sum by (cluster) (up)
+You should see one time series per cluster label (e.g., cluster="cluster-a", cluster="cluster-b").
+Check a metric known to exist only in one cluster (e.g., kube_node_info{cluster="cluster-a"}) and ensure it appears with correct labels.
+To validate historical storage via object store, wait some time (after compaction/downsampling runs) and query older ranges (several hours/days) to ensure continuity.
+7.4 Confirm cross-cluster PromQL
+From Thanos Query:
+Cross-cluster aggregation:
+sum by (cluster, job) (rate(http_requests_total[5m]))
+Confirm multiple clusters present.
+Cluster comparison:
+avg by (cluster) (node_load1)
+Ensure curves appear for each cluster label.
+If all of the above checks pass (TLS handshakes OK, Prometheus remote_write queues healthy, metrics visible in Thanos Query with cluster label), your centralized Prometheus + Thanos Receive architecture is correctly wired and production-ready.

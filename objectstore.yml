@@ -1,0 +1,8 @@
+type: s3
+config:
+  bucket: "thanos"
+  # Use the internal service DNS for MinIO
+  endpoint: "minio.object-storage.svc.cluster.local:9000"
+  access_key: "YOUR_MINIO_ACCESS_KEY"
+  secret_key: "YOUR_MINIO_SECRET_KEY"
+  insecure: true # Common for on-prem MinIO without TLS
