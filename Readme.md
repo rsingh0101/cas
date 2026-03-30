@@ -1,5 +1,5 @@
 # Centralized Monitoring Architecture (On-Prem, Multi-Cluster)
-
+![Architecture](docs/cas-architecture.png)
 ## Overview
 
 This document describes a centralized Prometheus monitoring architecture for multiple on-prem Kubernetes clusters using:
