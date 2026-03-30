@@ -1,46 +1,69 @@
-# Thanos Observability Architecture
-
 ```mermaid
 flowchart LR
 
-%% Bank Side
-Prometheus["Prometheus (Bank)"]
-HAProxyExt["HAProxy"]
-Distributor["Receive Distributor"]
-Receive["Thanos Receive (STS)"]
-MinIO["MinIO (Object Storage)"]
+%% =========================
+%% BANK / INGESTION
+%% =========================
+subgraph Bank_Side
+    Prom[Prometheus]
+end
 
-Prometheus -->|remote_write| HAProxyExt
-HAProxyExt --> Distributor
+subgraph NPCI_Ingress
+    ExtProxy[External HAProxy]
+    Distributor[Receive Distributor]
+    Receive[Thanos Receive STS]
+end
+
+Prom -->|remote_write| ExtProxy
+ExtProxy --> Distributor
 Distributor --> Receive
-Receive -->|Upload Blocks| MinIO
 
-%% Storage + Processing
-Compactor["Thanos Compactor"]
-MinIO --> Compactor
+%% =========================
+%% STORAGE
+%% =========================
+subgraph Storage
+    MinIO[MinIO Object Storage]
+    Compactor[Thanos Compactor]
+end
 
-%% Query Plane
-Store["Store Gateway"]
-QueryFrontend["Query Frontend"]
-Query["Thanos Query"]
+Receive -->|S3_upload| MinIO
+MinIO -.->|compaction| Compactor
+Compactor -.->|writes_blocks| MinIO
 
-MinIO --> Store
-Store --> Query
-Receive --> Query
-QueryFrontend --> Query
+%% =========================
+%% QUERY
+%% =========================
+subgraph Query_Plane
+    Store[Store Gateway]
+    QueryFrontend[Query Frontend]
+    Query[Thanos Query]
+end
 
-%% Alerting
-Ruler["Thanos Ruler"]
-Alertmanager["Alertmanager"]
+MinIO -->|read_blocks| Store
+Store -->|StoreAPI| Query
+Receive -->|StoreAPI_recent| Query
+QueryFrontend -->|HTTP_query| Query
 
-Ruler -->|Query API| Query
-Ruler -->|Alerts| Alertmanager
+%% =========================
+%% ALERTING
+%% =========================
+subgraph Alerting
+    Ruler[Thanos Ruler]
+    Alertmanager[Alertmanager]
+end
 
-%% User Layer
-HAProxyInt["Internal HAProxy"]
-Grafana["Grafana"]
+Ruler -->|PromQL_query| Query
+Ruler -->|alerts| Alertmanager
 
-Grafana --> HAProxyInt
-HAProxyInt --> QueryFrontend
-HAProxyInt --> Alertmanager
+%% =========================
+%% USER ACCESS
+%% =========================
+subgraph User_Access
+    Grafana[Grafana]
+    IntProxy[Internal HAProxy]
+end
+
+Grafana --> IntProxy
+IntProxy -->|query_path| QueryFrontend
+IntProxy -->|alert_ui| Alertmanager
 ```
