@@ -8,7 +8,7 @@ subgraph Bank_Side
     Prom[Prometheus]
 end
 
-subgraph NPCI_Ingress
+subgraph Ingress
     ExtProxy[External HAProxy]
     Distributor[Receive Distributor]
     Receive[Thanos Receive STS]
